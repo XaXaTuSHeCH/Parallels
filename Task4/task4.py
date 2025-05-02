@@ -187,7 +187,7 @@ frame = None
 running = True
 
 while running:
-    for i, queue in enumerate(queues):
+    for queue in queues:
         try:
             while not queue.empty():
                 name, data = queue.get_nowait()
