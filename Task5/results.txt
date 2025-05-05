@@ -1,0 +1,5 @@
+python test.py -v test.mp4 -t 1
+Processing time: 15.135 sec
+
+python test.py -v test.mp4 -t 4
+Processing time: 11.787 sec
