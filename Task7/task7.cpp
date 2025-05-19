@@ -1,172 +1,112 @@
-#include <boost/program_options.hpp>
 #include <iostream>
+#include <cmath>
 #include <chrono>
-#include <cublas_v2.h>
-#include <memory>
+#include <iomanip>
+#include <boost/program_options.hpp>
 #include <nvtx3/nvToolsExt.h>
+#include <cublas_v2.h>
 
-#define INDEX(row, col, width) ((row) * (width) + (col))
-
-void setup_grid(double* grid, double* grid_new, int rows, int cols) {
-    std::fill_n(grid, rows * cols, 0.0);
-    std::fill_n(grid_new, rows * cols, 0.0);
-
-    const double corner_top_left = 10.0;
-    const double corner_top_right = 20.0;
-    const double corner_bottom_right = 30.0;
-    const double corner_bottom_left = 20.0;
-
-    // Top boundary
-    for (int j = 0; j < cols; ++j) {
-        double t = static_cast<double>(j) / (cols - 1);
-        grid[INDEX(0, j, cols)] = grid_new[INDEX(0, j, cols)] = 
-            corner_top_left * (1.0 - t) + corner_top_right * t;
-    }
-
-    // Bottom boundary
-    for (int j = 0; j < cols; ++j) {
-        double t = static_cast<double>(j) / (cols - 1);
-        grid[INDEX(rows - 1, j, cols)] = grid_new[INDEX(rows - 1, j, cols)] = 
-            corner_bottom_left * (1.0 - t) + corner_bottom_right * t;
-    }
-
-    // Left boundary
-    for (int i = 0; i < rows; ++i) {
-        double t = static_cast<double>(i) / (rows - 1);
-        grid[INDEX(i, 0, cols)] = grid_new[INDEX(i, 0, cols)] = 
-            corner_top_left * (1.0 - t) + corner_bottom_left * t;
-    }
-
-    // Right boundary
-    for (int i = 0; i < rows; ++i) {
-        double t = static_cast<double>(i) / (rows - 1);
-        grid[INDEX(i, cols - 1, cols)] = grid_new[INDEX(i, cols - 1, cols)] = 
-            corner_top_right * (1.0 - t) + corner_bottom_right * t;
-    }
-}
-
-void cleanup(double* grid, double* grid_new) {
-    free(grid);
-    free(grid_new);
-}
-
-namespace opt = boost::program_options;
+namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) {
-    int grid_rows, grid_cols, max_iterations;
-    double convergence_threshold;
-
-    opt::options_description options("Command-line options");
-    options.add_options()
-        ("help,h", "display this help message")
-        ("grid-size,s", opt::value<int>(&grid_rows)->default_value(512), "grid size (s x s)")
-        ("tolerance,t", opt::value<double>(&convergence_threshold)->default_value(1.0e-6), "convergence tolerance")
-        ("max-iterations,m", opt::value<int>(&max_iterations)->default_value(1000000), "maximum iterations");
-
-    opt::variables_map config;
-    opt::store(opt::parse_command_line(argc, argv, options), config);
-    opt::notify(config);
-
-    if (config.count("help")) {
-        std::cout << options << std::endl;
+    int dimension;
+    double precision;
+    int iter_limit;
+    po::options_description config("Configuration");
+    config.add_options()
+        ("help", "show help")
+        ("size", po::value<int>(&dimension)->default_value(256), "grid size (N x N)")
+        ("accuracy", po::value<double>(&precision)->default_value(1e-6), "precision goal")
+        ("max_iterations", po::value<int>(&iter_limit)->default_value(1000000), "max iterations");
+    po::variables_map params;
+    po::store(po::parse_command_line(argc, argv, config), params);
+    po::notify(params);
+    if (params.count("help")) {
+        std::cout << config << "\n";
         return 1;
     }
-
-    grid_cols = grid_rows;
-
-    double* grid = static_cast<double*>(malloc(sizeof(double) * grid_rows * grid_cols));
-    double* grid_new = static_cast<double*>(malloc(sizeof(double) * grid_rows * grid_cols));
-
-    nvtxRangePush("setup");
-    setup_grid(grid, grid_new, grid_rows, grid_cols);
+    std::cout << "Launching computation...\n";
+    double* matrix = (double*)malloc(dimension * dimension * sizeof(double));
+    double* matrix_new = (double*)malloc(dimension * dimension * sizeof(double));
+    double* diff = (double*)malloc(dimension * dimension * sizeof(double));
+    nvtxRangePushA("setup");
+    for (size_t i = 0; i < dimension * dimension; i++) {
+        matrix[i] = 0.0;
+        matrix_new[i] = 0.0;
+        diff[i] = 0.0;
+    }
+    matrix[0] = 10.0;
+    matrix[dimension - 1] = 20.0;
+    matrix[dimension * (dimension - 1)] = 30.0;
+    matrix[dimension * dimension - 1] = 20.0;
+    double ul = matrix[0], ur = matrix[dimension - 1];
+    double ll = matrix[dimension * (dimension - 1)], lr = matrix[dimension * dimension - 1];
+    for (int i = 1; i < dimension - 1; i++) {
+        matrix[i] = ul + (ur - ul) * i / (dimension - 1.0);
+        matrix[dimension * (dimension - 1) + i] = ll + (lr - ll) * i / (dimension - 1.0);
+        matrix[dimension * i] = ul + (ll - ul) * i / (dimension - 1.0);
+        matrix[dimension * i + dimension - 1] = ur + (lr - ur) * i / (dimension - 1.0);
+    }
+    #pragma acc enter data create(diff[:dimension*dimension]) copyin(matrix[:dimension*dimension], matrix_new[:dimension*dimension])
     nvtxRangePop();
-
-    std::cout << "Running Jacobi solver on " << grid_rows << " x " << grid_cols << " grid\n";
-
-    auto start_time = std::chrono::steady_clock::now();
-    int iteration_count = 0;
-    double max_diff = 1.0;
-
-    auto cublas_cleanup = [](cublasHandle_t* handle) {
-        if (handle && *handle) {
-            cublasDestroy(*handle);
-            delete handle;
-        }
-    };
-
-    std::unique_ptr<cublasHandle_t, decltype(cublas_cleanup)> cublas_handle(
-        new cublasHandle_t, cublas_cleanup);
-    cublasCreate(cublas_handle.get());
-
-    double* device_diff_array;
-    cudaMalloc(&device_diff_array, sizeof(double) * grid_rows * grid_cols);
-
-    int max_diff_index;
-    nvtxRangePush("solver_loop");
-    #pragma acc data copy(grid[0:grid_rows*grid_cols], grid_new[0:grid_rows*grid_cols]) \
-                     create(device_diff_array[0:grid_rows*grid_cols])
-    {
-        while (max_diff > convergence_threshold && iteration_count < max_iterations) {
-            #pragma acc parallel loop collapse(2) present(grid, grid_new)
-            for (int i = 1; i < grid_rows - 1; ++i) {
-                for (int j = 1; j < grid_cols - 1; ++j) {
-                    grid_new[INDEX(i, j, grid_cols)] = 0.25 * (
-                        grid[INDEX(i, j + 1, grid_cols)] + 
-                        grid[INDEX(i, j - 1, grid_cols)] + 
-                        grid[INDEX(i + 1, j, grid_cols)] + 
-                        grid[INDEX(i - 1, j, grid_cols)]
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    double error = precision + 1.0;
+    int iter_count = 0;
+    auto start = std::chrono::steady_clock::now();
+    nvtxRangePushA("main_loop");
+    while (error > precision && iter_count < iter_limit) {
+        bool compute_error = (iter_count % 1000 == 0);
+        if (compute_error) {
+            #pragma acc parallel loop present(matrix, matrix_new, diff)
+            for (int i = 1; i < dimension - 1; i++) {
+                for (int j = 1; j < dimension - 1; j++) {
+                    size_t idx = i * dimension + j;
+                    matrix_new[idx] = 0.25 * (
+                        matrix[(i + 1) * dimension + j] +
+                        matrix[(i - 1) * dimension + j] +
+                        matrix[i * dimension + j - 1] +
+                        matrix[i * dimension + j + 1]
+                    );
+                    diff[idx] = fabs(matrix_new[idx] - matrix[idx]);
+                }
+            }
+            int max_idx;
+            cublasIdamax(handle, dimension * dimension, diff, 1, &max_idx);
+            #pragma acc update self(diff[max_idx-1:1])
+            error = diff[max_idx - 1];
+        } else {
+            #pragma acc parallel loop present(matrix, matrix_new)
+            for (int i = 1; i < dimension - 1; i++) {
+                for (int j = 1; j < dimension - 1; j++) {
+                    size_t idx = i * dimension + j;
+                    matrix_new[idx] = 0.25 * (
+                        matrix[(i + 1) * dimension + j] +
+                        matrix[(i - 1) * dimension + j] +
+                        matrix[i * dimension + j - 1] +
+                        matrix[i * dimension + j + 1]
                     );
                 }
             }
-
-            if (iteration_count % 1000 == 0) {
-                #pragma acc parallel loop collapse(2) present(grid, grid_new, device_diff_array)
-                for (int i = 1; i < grid_rows - 1; ++i) {
-                    for (int j = 1; j < grid_cols - 1; ++j) {
-                        device_diff_array[INDEX(i, j, grid_cols)] = 
-                            std::abs(grid_new[INDEX(i, j, grid_cols)] - grid[INDEX(i, j, grid_cols)]);
-                    }
-                }
-
-                #pragma acc host_data use_device(device_diff_array)
-                {
-                    cublasStatus_t status = cublasIdamax(
-                        *cublas_handle, grid_rows * grid_cols, device_diff_array, 1, &max_diff_index);
-                    if (status != CUBLAS_STATUS_SUCCESS) {
-                        std::cerr << "Error in cublasIdamax\n";
-                    }
-
-                    if (max_diff_index > 0 && max_diff_index <= grid_rows * grid_cols) {
-                        max_diff_index -= 1;
-                        cudaMemcpy(&max_diff, &device_diff_array[max_diff_index], 
-                                  sizeof(double), cudaMemcpyDeviceToHost);
-                    } else {
-                        std::cerr << "Invalid index from cublasIdamax: " << max_diff_index + 1 << "\n";
-                        max_diff = 0.0;
-                    }
-                }
-            }
-
-            std::swap(grid, grid_new);
-
-            if (iteration_count % 10000 == 0) {
-                std::cout << "Iteration " << iteration_count << ", max difference: " << max_diff << "\n";
-            }
-
-            ++iteration_count;
         }
+        #pragma acc parallel loop present(matrix, matrix_new)
+        for (int i = 1; i < dimension - 1; i++) {
+            for (int j = 1; j < dimension - 1; j++) {
+                matrix[i * dimension + j] = matrix_new[i * dimension + j];
+            }
+        }
+        iter_count++;
     }
     nvtxRangePop();
-
-    auto end_time = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time);
-
-    std::cout << "Total iterations: " << iteration_count << "\n";
-    std::cout << "Final max difference: " << max_diff << "\n";
-    std::cout << "Execution time: " << elapsed.count() << " seconds\n";
-
-    cudaFree(device_diff_array);
-    cleanup(grid, grid_new);
-
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Time elapsed: " << elapsed.count() << " seconds\n";
+    std::cout << "Iterations performed: " << iter_count << "\n";
+    std::cout << "Achieved error: " << error << "\n";
+    #pragma acc exit data delete(matrix[:dimension*dimension], matrix_new[:dimension*dimension], diff[:dimension*dimension])
+    cublasDestroy(handle);
+    free(matrix);
+    free(matrix_new);
+    free(diff);
     return 0;
 }

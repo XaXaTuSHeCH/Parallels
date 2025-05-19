@@ -10,4 +10,4 @@ cpu_multi:
 
 gpu:
 	pgc++ -o therm_gpu -lboost_program_options -acc=gpu -Minfo=all -I/opt/nvidia/hpc_sdk/Linux_x86_64/23.11/cuda/12.3/include therm_gpu.cpp
-	./therm_gpu --size=1024 --accuracy=0.000001 --max_iterations=1000000
+	./therm_gpu --size=128 --accuracy=0.000001 --max_iterations=1000000
